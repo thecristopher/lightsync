@@ -2,7 +2,12 @@
 //!
 //! Bluetooth manages ~10-20 writes a second, so this is frugal: in segment mode it only writes the
 //! segments that changed, and merges segments sharing a colour into one masked packet.
+//!
+//! Newer models want their frames encrypted. A light that doesn't answer a plain keepalive gets the
+//! handshake, and whichever way works is remembered for the next connect.
 
+use std::hash::{BuildHasher, RandomState};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,17 +18,20 @@ use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher, BluetoothLEScanningMode,
 };
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
-    GattCharacteristic, GattCommunicationStatus, GattWriteOption,
+    GattCharacteristic, GattClientCharacteristicConfigurationDescriptorValue, GattCommunicationStatus,
+    GattDeviceService, GattValueChangedEventArgs, GattWriteOption,
 };
 use windows::Devices::Bluetooth::{BluetoothCacheMode, BluetoothLEDevice};
 use windows::Foundation::TypedEventHandler;
-use windows::Storage::Streams::DataWriter;
+use windows::Storage::Streams::{DataReader, DataWriter};
 use windows_core::GUID;
 
 use super::{Light, average};
 
 /// Segments quantized to steps of this size share packets more often.
 const QUANT: u8 = 8;
+/// Replies come back within ~50 ms; lights that never reply are given this long.
+const REPLY_WAIT: Duration = Duration::from_millis(1500);
 
 pub fn parse_address(address: &str) -> Option<u64> {
     let hex: String = address.chars().filter(|c| c.is_ascii_hexdigit()).collect();
@@ -85,17 +93,107 @@ pub struct BleLight {
     on_exit: OnExit,
     min_delta: u8,
     device: Option<BluetoothLEDevice>,
+    service: Option<GattDeviceService>,
     characteristic: Option<GattCharacteristic>,
+    replies: Option<Replies>,
+    /// Learned on the first connect: `Some(true)` needs the handshake, `Some(false)` takes plaintext.
+    encrypted: Option<bool>,
+    key: Option<[u8; 16]>,
     last: Option<Vec<Rgb>>,
+}
+
+/// Notifications from the reply characteristic.
+struct Replies {
+    characteristic: GattCharacteristic,
+    token: i64,
+    frames: Receiver<Vec<u8>>,
+}
+
+impl Replies {
+    fn subscribe(characteristic: GattCharacteristic) -> Result<Self> {
+        let (sender, frames) = sync_channel(16);
+        let token = characteristic.ValueChanged(
+            &TypedEventHandler::<GattCharacteristic, GattValueChangedEventArgs>::new(move |_, args| {
+                if let Some(args) = args.as_ref() {
+                    let buffer = args.CharacteristicValue()?;
+                    let mut frame = vec![0; buffer.Length()? as usize];
+                    DataReader::FromBuffer(&buffer)?.ReadBytes(&mut frame)?;
+                    // Replies nobody waits for are dropped once the queue is full
+                    let _ = sender.try_send(frame);
+                }
+                Ok(())
+            }),
+        )?;
+        let status = characteristic
+            .WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::Notify,
+            )?
+            .join()?;
+        if status != GattCommunicationStatus::Success {
+            let _ = characteristic.RemoveValueChanged(token);
+            bail!("couldn't listen for its replies");
+        }
+        Ok(Self { characteristic, token, frames })
+    }
+
+    fn clear(&self) {
+        while self.frames.try_recv().is_ok() {}
+    }
+
+    /// The first reply `accept` makes something of, within `wait`.
+    fn wait_for<T>(&self, wait: Duration, mut accept: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
+        let until = Instant::now() + wait;
+        while let Ok(frame) = self.frames.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            if let Some(found) = accept(&frame) {
+                return Some(found);
+            }
+        }
+        None
+    }
+}
+
+impl Drop for Replies {
+    fn drop(&mut self) {
+        let _ = self.characteristic.RemoveValueChanged(self.token);
+    }
+}
+
+fn nonce() -> [u8; 17] {
+    let state = RandomState::new();
+    let mut nonce = [0; 17];
+    for (i, chunk) in nonce.chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&state.hash_one(i).to_le_bytes()[..chunk.len()]);
+    }
+    nonce
 }
 
 impl BleLight {
     pub fn new(address: &str, mode: BleMode, command: BleColorCommand, on_exit: OnExit, min_delta: u8) -> Result<Self> {
         let address = parse_address(address).with_context(|| format!("\"{address}\" isn't a Bluetooth address"))?;
-        Ok(Self { address, mode, command, on_exit, min_delta, device: None, characteristic: None, last: None })
+        Ok(Self {
+            address,
+            mode,
+            command,
+            on_exit,
+            min_delta,
+            device: None,
+            service: None,
+            characteristic: None,
+            replies: None,
+            encrypted: None,
+            key: None,
+            last: None,
+        })
     }
 
     fn write(&self, packet: &[u8]) -> Result<()> {
+        match &self.key {
+            Some(key) => self.write_raw(&gp::ble_cipher(packet, key, true)),
+            None => self.write_raw(packet),
+        }
+    }
+
+    fn write_raw(&self, packet: &[u8]) -> Result<()> {
         let characteristic = self.characteristic.as_ref().context("not connected")?;
         let writer = DataWriter::new()?;
         writer.WriteBytes(packet)?;
@@ -106,6 +204,42 @@ impl BleLight {
         if result.Status()? != GattCommunicationStatus::Success {
             bail!("the light stopped answering over Bluetooth");
         }
+        Ok(())
+    }
+
+    /// Works out whether the light wants encrypted frames, and gets the session key if it does.
+    fn negotiate(&mut self) -> Result<()> {
+        self.key = None;
+        let Some(replies) = &self.replies else {
+            // Nothing to hear an answer on, so all that's left is plaintext
+            return Ok(());
+        };
+        if self.encrypted.is_none() {
+            replies.clear();
+            self.write_raw(&gp::ble_keepalive())?;
+            if replies.wait_for(REPLY_WAIT, |f| (f.first() == Some(&0xAA)).then_some(())).is_some() {
+                self.encrypted = Some(false);
+            }
+        }
+        if self.encrypted == Some(false) {
+            return Ok(());
+        }
+        replies.clear();
+        self.write_raw(&gp::ble_handshake(1, nonce()))?;
+        let Some(key) = replies.wait_for(REPLY_WAIT, |f| gp::ble_handshake_reply(f, 1)) else {
+            if self.encrypted.is_none() {
+                // Answers neither way; plaintext is how it worked before encryption came along
+                self.encrypted = Some(false);
+                return Ok(());
+            }
+            bail!("it didn't answer the encryption handshake");
+        };
+        self.write_raw(&gp::ble_handshake(2, nonce()))?;
+        if replies.wait_for(REPLY_WAIT, |f| gp::ble_handshake_reply(f, 2)).is_none() {
+            bail!("it didn't confirm the encryption handshake");
+        }
+        self.encrypted = Some(true);
+        self.key = Some(key);
         Ok(())
     }
 }
@@ -124,16 +258,26 @@ impl Light for BleLight {
             bail!("couldn't reach it over Bluetooth (is the Govee app connected to it on a phone?)");
         }
         let service = services.Services()?.GetAt(0)?;
-        let characteristics = service.GetCharacteristicsForUuidAsync(GUID::from_u128(gp::BLE_CONTROL_CHAR))?.join()?;
-        if characteristics.Status()? != GattCommunicationStatus::Success
-            || characteristics.Characteristics()?.Size()? == 0
-        {
-            bail!("it doesn't take Govee commands");
-        }
-        self.characteristic = Some(characteristics.Characteristics()?.GetAt(0)?);
+        // Kept so close() can close it: Windows holds the link open while a service object lives
+        self.service = Some(service.clone());
         self.device = Some(device);
+        let characteristic = |uuid: u128| -> Result<Option<GattCharacteristic>> {
+            let found = service.GetCharacteristicsForUuidAsync(GUID::from_u128(uuid))?.join()?;
+            if found.Status()? != GattCommunicationStatus::Success || found.Characteristics()?.Size()? == 0 {
+                return Ok(None);
+            }
+            Ok(Some(found.Characteristics()?.GetAt(0)?))
+        };
+        self.characteristic = Some(characteristic(gp::BLE_CONTROL_CHAR)?.context("it doesn't take Govee commands")?);
+        self.replies = characteristic(gp::BLE_REPLY_CHAR)?.and_then(|c| Replies::subscribe(c).ok());
         self.last = None;
-        crate::log::log!("bluetooth {} connected in {:?}", format_address(self.address), started.elapsed());
+        self.negotiate()?;
+        crate::log::log!(
+            "bluetooth {} connected in {:?}{}",
+            format_address(self.address),
+            started.elapsed(),
+            if self.key.is_some() { ", encrypted" } else { "" }
+        );
         self.write(&gp::ble_power(true))
     }
 
@@ -171,7 +315,12 @@ impl Light for BleLight {
         if restore && self.on_exit == OnExit::Off {
             let _ = self.write(&gp::ble_power(false));
         }
+        self.replies = None;
         self.characteristic = None;
+        self.key = None;
+        if let Some(service) = self.service.take() {
+            let _ = service.Close();
+        }
         if let Some(device) = self.device.take() {
             let _ = device.Close();
         }
