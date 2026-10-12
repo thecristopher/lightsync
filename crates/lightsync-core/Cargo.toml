@@ -1,0 +1,10 @@
+[package]
+name = "lightsync-core"
+description = "Govee wire formats, screen zones, colour processing and settings. No OS code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/lightsync-core", "crates/lightsync"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/thecristopher/lightsync"
+
+[workspace.dependencies]
+lightsync-core = { path = "crates/lightsync-core" }
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+socket2 = "0.6"
+windows = "0.62.2"
+windows-core = "0.62.2"
+windows-future = "0.3"
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
