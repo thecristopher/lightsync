@@ -7,6 +7,9 @@
 //! - each light gets "latest colour wins": a slow light skips frames instead of queueing them, and
 //!   a colour that barely moved isn't sent at all, only an occasional keepalive.
 //!
+//! - when the screen turns off (or the PC locks, if asked), the lights go off and the capture stops
+//!   until the screen comes back.
+//!
 //! Settings changes are applied live: colours and layouts change on the next frame, and only a light
 //! whose connection settings changed is reconnected.
 
@@ -30,6 +33,7 @@ use crate::lights::Light;
 use crate::lights::ble::{self, BleLight};
 use crate::lights::lan::{LanBus, LanLight};
 use crate::log::log;
+use crate::watch::{self, ScreenEvent};
 
 const KEEPALIVE: Duration = Duration::from_secs(2);
 const IDENTIFY_FOR: Duration = Duration::from_secs(8);
@@ -48,6 +52,8 @@ struct Shared {
     wake: Condvar,
     identify: Mutex<Option<(String, Instant)>>,
     bus: Mutex<Option<Arc<LanBus>>>,
+    /// What Windows last said: (display off, locked)
+    screen: Mutex<(bool, bool)>,
 }
 
 impl Shared {
@@ -81,6 +87,22 @@ impl Shared {
         Ok(opened)
     }
 
+    fn screen_event(&self, event: ScreenEvent) {
+        let mut screen = self.screen.lock().unwrap();
+        let before = *screen;
+        match event {
+            ScreenEvent::DisplayOff | ScreenEvent::Suspending => screen.0 = true,
+            ScreenEvent::DisplayOn => screen.0 = false,
+            ScreenEvent::Locked => screen.1 = true,
+            ScreenEvent::Unlocked => screen.1 = false,
+        }
+        if *screen != before {
+            drop(screen);
+            log!("screen: {event:?}");
+            self.signal(|s| s.reload = true);
+        }
+    }
+
     fn set_status(&self, state: SyncState, detail: &str) {
         let mut status = self.status.lock().unwrap();
         status.state = state;
@@ -111,7 +133,16 @@ impl Engine {
             wake: Condvar::new(),
             identify: Mutex::new(None),
             bus: Mutex::new(None),
+            screen: Mutex::new((false, false)),
         });
+        let listener = Arc::downgrade(&shared);
+        if let Err(e) = watch::spawn(move |event| {
+            if let Some(shared) = listener.upgrade() {
+                shared.screen_event(event);
+            }
+        }) {
+            log!("can't follow the screen turning off: {e:#}");
+        }
         let worker = shared.clone();
         let thread = std::thread::Builder::new().name("engine".into()).spawn(move || run(&worker)).ok();
         Self { shared, thread }
@@ -251,7 +282,24 @@ fn run(shared: &Arc<Shared>) {
             shared.rest(Duration::from_secs(3600));
             continue;
         }
+        let (display_off, locked) = *shared.screen.lock().unwrap();
+        if settings.lights_off.applies(display_off, locked) {
+            // Lights off and capture stopped, but each light remembers how to be put back later
+            let detail = if display_off { "The screen is off" } else { "The PC is locked" };
+            shared.set_status(SyncState::Sleeping, detail);
+            if let Some(session) = session.as_mut() {
+                session.sleep();
+            }
+            while !shared.pending() {
+                if let Some(session) = session.as_mut() {
+                    session.publish_lights();
+                }
+                shared.rest(Duration::from_secs(2));
+            }
+            continue;
+        }
         let session = session.get_or_insert_with(|| Session::new(shared.clone()));
+        session.wake();
         session.apply(&settings);
         session.run_until_signal(&settings);
     }
@@ -364,6 +412,30 @@ impl Session {
         }
     }
 
+    fn sleep(&mut self) {
+        self.capture = None;
+        for worker in &self.workers {
+            worker.slot.asleep.store(true, Ordering::Relaxed);
+            worker.slot.wake.notify_all();
+        }
+    }
+
+    fn wake(&mut self) {
+        for worker in &mut self.workers {
+            if worker.slot.asleep.swap(false, Ordering::Relaxed) {
+                worker.slot.wake.notify_all();
+                worker.pipeline.settled = false;
+            }
+        }
+    }
+
+    fn publish_lights(&mut self) {
+        let elapsed = self.fps_since.elapsed();
+        let lights: Vec<LightStatus> = self.workers.iter_mut().map(|w| w.status(elapsed)).collect();
+        self.fps_since = Instant::now();
+        self.shared.status.lock().unwrap().lights = lights;
+    }
+
     fn identify_target(&self) -> Option<String> {
         let mut identify = self.shared.identify.lock().unwrap();
         match identify.as_ref() {
@@ -451,6 +523,8 @@ struct Slot {
     latest: Mutex<Option<Vec<Rgb>>>,
     wake: Condvar,
     stop: AtomicBool,
+    /// Set while the screen is off: the light is switched off and waits
+    asleep: AtomicBool,
     sends: AtomicU64,
     shown: Mutex<Vec<Rgb>>,
     link: Mutex<(LinkState, String)>,
@@ -467,13 +541,23 @@ impl Slot {
         let latest = self.latest.lock().unwrap();
         let (mut latest, _) = self
             .wake
-            .wait_timeout_while(latest, timeout, |l| l.is_none() && !self.stop.load(Ordering::Relaxed))
+            .wait_timeout_while(latest, timeout, |l| l.is_none() && !self.stop.load(Ordering::Relaxed) && !self.asleep())
             .unwrap();
         latest.take()
     }
 
     fn set_link(&self, state: LinkState, detail: impl Into<String>) {
         *self.link.lock().unwrap() = (state, detail.into());
+    }
+
+    fn asleep(&self) -> bool {
+        self.asleep.load(Ordering::Relaxed)
+    }
+
+    /// Waits for the screen to come back, or for a stop.
+    fn wait_awake(&self) {
+        let latest = self.latest.lock().unwrap();
+        drop(self.wake.wait_while(latest, |_| self.asleep() && !self.stop.load(Ordering::Relaxed)));
     }
 
     /// Sleeps, waking early when told to stop.
@@ -586,6 +670,11 @@ impl Drop for Worker {
 fn stream(light: &mut dyn Light, slot: &Slot, name: &str, min_delta: u8, min_interval: Duration) {
     let mut backoff = Duration::from_secs(1);
     'connect: while !slot.stop.load(Ordering::Relaxed) {
+        if slot.asleep() {
+            slot.set_link(LinkState::Off, "Off while the screen is off");
+            slot.wait_awake();
+            continue;
+        }
         slot.set_link(LinkState::Connecting, "Connecting");
         if let Err(e) = light.connect() {
             let reason = format!("{e:#}");
@@ -602,6 +691,11 @@ fn stream(light: &mut dyn Light, slot: &Slot, name: &str, min_delta: u8, min_int
         let mut sent: Option<Vec<Rgb>> = None;
         let mut last_io = Instant::now();
         while !slot.stop.load(Ordering::Relaxed) {
+            if slot.asleep() {
+                light.sleep();
+                log!("{name}: off with the screen");
+                continue 'connect;
+            }
             let wait = KEEPALIVE.saturating_sub(last_io.elapsed());
             let result = match slot.take(wait) {
                 Some(colors) if changed(sent.as_deref(), &colors, min_delta) => {
@@ -631,7 +725,8 @@ fn stream(light: &mut dyn Light, slot: &Slot, name: &str, min_delta: u8, min_int
             }
         }
     }
-    light.close(true);
+    // Quitting while the screen is off leaves the lights off rather than lighting them back up
+    light.close(!slot.asleep());
     log!("{name}: let go");
 }
 

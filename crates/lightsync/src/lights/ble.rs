@@ -161,6 +161,12 @@ impl Light for BleLight {
         self.write(&gp::ble_keepalive())
     }
 
+    fn sleep(&mut self) {
+        let _ = self.write(&gp::ble_power(false));
+        // Let go of the connection too; connect() opens it again
+        self.close(false);
+    }
+
     fn close(&mut self, restore: bool) {
         if restore && self.on_exit == OnExit::Off {
             let _ = self.write(&gp::ble_power(false));

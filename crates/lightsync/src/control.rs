@@ -63,6 +63,8 @@ pub enum SyncState {
     Starting,
     Running,
     Trouble,
+    /// The lights are off because the screen is off or the PC is locked
+    Sleeping,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +74,8 @@ pub enum LinkState {
     Connecting,
     Live,
     Trouble,
+    /// Switched off along with the screen
+    Off,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

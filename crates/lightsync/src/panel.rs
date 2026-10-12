@@ -10,6 +10,7 @@ pub fn title(status: Option<&EngineStatus>) -> String {
         Some(SyncState::Starting) => "Starting".into(),
         Some(SyncState::Running) => "Syncing".into(),
         Some(SyncState::Trouble) => "Can't see the screen".into(),
+        Some(SyncState::Sleeping) => "Lights off".into(),
     }
 }
 

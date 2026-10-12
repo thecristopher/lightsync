@@ -12,6 +12,7 @@ mod panel;
 mod setup;
 mod tray;
 mod ui;
+mod watch;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

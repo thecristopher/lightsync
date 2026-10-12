@@ -14,6 +14,9 @@ pub trait Light: Send {
     fn send(&mut self, colors: &[Rgb]) -> Result<()>;
     /// Called when nothing was sent for a while, so the light stays in streaming mode.
     fn keepalive(&mut self) -> Result<()>;
+    /// Switches the light off and leaves streaming mode, for while the screen is off.
+    /// `connect` brings it back.
+    fn sleep(&mut self);
     /// Hands the light back: the way it was, off, or as it is, depending on its settings.
     fn close(&mut self, restore: bool);
 }

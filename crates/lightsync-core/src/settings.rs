@@ -17,12 +17,20 @@ pub struct Settings {
     pub capture: CaptureSettings,
     /// Colour tuning every light uses unless it has its own
     pub color: ColorSettings,
+    /// When to switch the lights off along with the screen
+    pub lights_off: LightsOff,
     pub lights: Vec<Light>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { enabled: true, capture: CaptureSettings::default(), color: ColorSettings::default(), lights: Vec::new() }
+        Self {
+            enabled: true,
+            capture: CaptureSettings::default(),
+            color: ColorSettings::default(),
+            lights_off: LightsOff::default(),
+            lights: Vec::new(),
+        }
     }
 }
 
@@ -153,6 +161,30 @@ impl Default for Connection {
     }
 }
 
+/// Switching the lights off when nobody is looking at the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightsOff {
+    /// Keep them on, showing the last colour
+    Never,
+    /// When Windows turns the display off (or the PC goes to sleep)
+    #[default]
+    ScreenOff,
+    /// Also as soon as the PC is locked
+    ScreenOffOrLocked,
+}
+
+impl LightsOff {
+    /// Whether the lights should be off, given what Windows last said about the screen.
+    pub fn applies(self, display_off: bool, locked: bool) -> bool {
+        match self {
+            LightsOff::Never => false,
+            LightsOff::ScreenOff => display_off,
+            LightsOff::ScreenOffOrLocked => display_off || locked,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LanMode {
@@ -232,6 +264,15 @@ mod tests {
         assert!(settings.capture.letterbox);
         assert_eq!(settings.lights[0].name, "Desk");
         assert!(settings.lights[0].enabled);
+    }
+
+    #[test]
+    fn lights_go_off_only_when_asked() {
+        assert!(!LightsOff::Never.applies(true, true));
+        assert!(LightsOff::ScreenOff.applies(true, false));
+        assert!(!LightsOff::ScreenOff.applies(false, true), "locking alone keeps them on");
+        assert!(LightsOff::ScreenOffOrLocked.applies(false, true));
+        assert_eq!(Settings::default().lights_off, LightsOff::ScreenOff);
     }
 
     #[test]

@@ -36,6 +36,7 @@ pub fn status() -> Result<()> {
             LinkState::Live => format!("live, {:.0} updates/s", light.sends_per_second),
             LinkState::Connecting => "connecting".into(),
             LinkState::Trouble => format!("trouble: {}", light.detail),
+            LinkState::Off => "off with the screen".into(),
         };
         text.push_str(&format!("  {}: {state}\n", light.name));
     }

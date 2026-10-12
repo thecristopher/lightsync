@@ -27,6 +27,8 @@ screen ──DXGI Desktop Duplication──▶ GPU averages it down (mipmaps) �
   depth, update rate, its own colour tuning, and what happens when LightSync stops. For everything:
   display, analysis rate, detail, black bar detection and shared colour tuning. Changes apply live.
 - **Polite.** When sync pauses or the app quits, each light goes back to the colour and power it had.
+- **Off with the screen.** When Windows turns the display off (or the PC sleeps), the lights switch off
+  and the capture stops; they come back on with the screen. Optionally also as soon as you lock the PC.
 
 ## Install
 
@@ -58,7 +60,8 @@ Click the tray icon to open LightSync:
   - *Whole screen* (or just the middle), *Grid* (panels, curtain lights, zigzag wiring) and *Bands*.
   - **Identify** lights the first segment red and the last blue with a white dot walking between
     them, so you can match segment count and direction.
-- **Screen & colour** picks the display, how often to analyse it, black bar detection, and the colour
+- **Screen & colour** picks the display, how often to analyse it, black bar detection, when to turn
+  the lights off (when the screen turns off, also when you lock the PC, or never), and the colour
   tuning every light shares unless it has its own.
 
 ### From the terminal

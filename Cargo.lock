@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "lightsync"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "lightsync-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",

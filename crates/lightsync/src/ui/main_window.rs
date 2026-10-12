@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 use lightsync_core::color::ColorSettings;
 use lightsync_core::govee::{BleColorCommand, Rgb};
-use lightsync_core::settings::{BleMode, Connection, LanMode, Light, OnExit, short_id};
+use lightsync_core::settings::{BleMode, Connection, LanMode, Light, LightsOff, OnExit, short_id};
 use lightsync_core::zones::{Layout as ZoneLayout, Sampling, Side, split_counts};
 
 use super::model::{Model, Scan};
@@ -288,6 +288,7 @@ impl MainWindow {
                     (format!("Live · {:.0} updates a second", l.sends_per_second), style::GOOD)
                 }
                 (Some(l), _) if l.state == LinkState::Trouble => (l.detail.clone(), style::WARNING),
+                (Some(l), _) if l.state == LinkState::Off => ("Off while the screen is off".to_string(), style::FAINT),
                 (Some(_), _) => ("Connecting…".to_string(), style::SECONDARY),
                 (None, _) => ("Waiting for sync to start".to_string(), style::FAINT),
             };
@@ -742,7 +743,8 @@ impl MainWindow {
     fn general_page(&mut self, ui: &mut egui::Ui, status: Option<&EngineStatus>) {
         ui.label(RichText::new("Screen & colour").font(style::semibold(22.0)).color(Color32::WHITE));
         let mut edited = false;
-        let capture = &mut self.model.settings.capture;
+        let settings = &mut self.model.settings;
+        let (capture, lights_off) = (&mut settings.capture, &mut settings.lights_off);
 
         section(ui, "Screen");
         style::card(ui, |ui| {
@@ -768,6 +770,24 @@ impl MainWindow {
                 edited = true;
             }
             edited |= ui.checkbox(&mut capture.letterbox, "Ignore black bars in films").changed();
+            ui.horizontal(|ui| {
+                ui.label("Turn the lights off");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = |choice: LightsOff| match choice {
+                        LightsOff::Never => "Never",
+                        LightsOff::ScreenOff => "When the screen turns off",
+                        LightsOff::ScreenOffOrLocked => "When the screen turns off or I lock the PC",
+                    };
+                    egui::ComboBox::from_id_salt("lights_off").selected_text(label(*lights_off)).width(300.0).show_ui(
+                        ui,
+                        |ui| {
+                            for choice in [LightsOff::ScreenOff, LightsOff::ScreenOffOrLocked, LightsOff::Never] {
+                                edited |= ui.selectable_value(lights_off, choice, label(choice)).changed();
+                            }
+                        },
+                    );
+                });
+            });
         });
         let note = match status {
             Some(s) if s.state == SyncState::Running && s.fps < 0.5 => {

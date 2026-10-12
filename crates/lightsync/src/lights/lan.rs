@@ -242,6 +242,14 @@ impl Light for LanLight {
         Ok(())
     }
 
+    fn sleep(&mut self) {
+        if self.mode == LanMode::Razer {
+            self.command(&gp::lan_razer(&gp::razer_enable(false)));
+        }
+        self.command(&gp::lan_turn(false));
+        self.last = None;
+    }
+
     fn close(&mut self, restore: bool) {
         if self.mode == LanMode::Razer {
             self.command(&gp::lan_razer(&gp::razer_enable(false)));
