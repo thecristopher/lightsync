@@ -85,8 +85,8 @@ Settings live in `%APPDATA%\LightSync\settings.json`, the log in `%LOCALAPPDATA%
 | Wi-Fi with LAN Control | **Per segment**. If it ignores that, **Whole light** works on every LAN model. |
 | Bluetooth only | **Whole light**. If the colour doesn't change, try another *Colour command*. RGBIC models can try **Per segment**. |
 
-Verified on H6046, H6056 and H618A over Wi-Fi (per segment) and H6008 over Bluetooth. Reports for other
-models are welcome.
+Verified on H6046, H6056 and H618A over Wi-Fi (per segment) and H6008 and H6097 over Bluetooth. Reports
+for other models are welcome.
 
 ## How it talks to the lights
 
@@ -101,9 +101,13 @@ The wire formats are in [`crates/lightsync-core/src/govee.rs`](crates/lightsync-
 - **Bluetooth**: 20 byte packets written to `00010203-0405-0607-0809-0a0b0c0d2b11`, the payload padded
   to 19 bytes plus an XOR checksum: `33 01` power, `33 05 0D|02 r g b` colour,
   `33 05 15 01 r g b 00×5 <mask>` segment colour, `AA 01` keepalive.
+  Newer models (H6097, …) ignore plaintext: they take a two step handshake (`E7 01|02 <nonce>`,
+  encrypted with the key `MakingLifeSmarte`) that hands out a session key, and every frame after it is
+  encrypted with that key: AES-128-ECB over the first 16 bytes, RC4 over the last 4.
 
-Thanks to OpenRGB (`GoveeController`), Home Assistant (`govee_light_local`, `govee-ble`) and
-`wez/govee2mqtt`, whose reverse engineering this builds on.
+Thanks to OpenRGB (`GoveeController`), Home Assistant (`govee_light_local`, `govee-ble`),
+`wez/govee2mqtt` and `teh-hippo/ha-govee-led-ble` (BLE encryption), whose reverse engineering this
+builds on.
 
 ## Crates
 

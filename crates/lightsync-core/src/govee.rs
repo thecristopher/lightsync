@@ -128,6 +128,8 @@ pub fn parse_reply(data: &[u8]) -> Option<LanReply> {
 
 pub const BLE_SERVICE: u128 = 0x00010203_0405_0607_0809_0a0b0c0d1910;
 pub const BLE_CONTROL_CHAR: u128 = 0x00010203_0405_0607_0809_0a0b0c0d2b11;
+/// Replies arrive here as notifications
+pub const BLE_REPLY_CHAR: u128 = 0x00010203_0405_0607_0809_0a0b0c0d2b10;
 /// "GVH…" names are thermometers and other sensors, so they're left out.
 pub const BLE_NAME_PREFIXES: [&str; 4] = ["ihoment_", "Govee_", "GBK_", "Minger_"];
 
@@ -178,6 +180,60 @@ pub fn ble_segment_color(rgb: Rgb, mask: u64, mask_bytes: usize) -> Vec<u8> {
     let mut payload = vec![0x33, 0x05, 0x15, 0x01, r, g, b, 0, 0, 0, 0, 0];
     payload.extend_from_slice(&mask.to_le_bytes()[..mask_bytes.clamp(1, 7)]);
     ble_packet(&payload)
+}
+
+/// Newer models (H6097 and friends) only obey frames encrypted with a session key they hand out in a
+/// two step handshake, the Govee app's "v1" scheme (`Controller4Aes`, as documented by
+/// `teh-hippo/ha-govee-led-ble`). Plaintext is acknowledged, ignored, and dropped after ~10 s.
+const BLE_HANDSHAKE_KEY: [u8; 16] = *b"MakingLifeSmarte";
+
+/// AES-128-ECB over the whole 16 byte blocks, RC4 over the rest. Both directions, both phases.
+pub fn ble_cipher(data: &[u8], key: &[u8; 16], encrypt: bool) -> Vec<u8> {
+    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+    let aes = aes::Aes128::new(key.into());
+    let mut out = data.to_vec();
+    let boundary = data.len() / 16 * 16;
+    for block in out[..boundary].chunks_mut(16) {
+        if encrypt {
+            aes.encrypt_block(block.into());
+        } else {
+            aes.decrypt_block(block.into());
+        }
+    }
+    rc4(key, &mut out[boundary..]);
+    out
+}
+
+fn rc4(key: &[u8], data: &mut [u8]) {
+    let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
+    let mut j = 0u8;
+    for i in 0..256 {
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+        s.swap(i, j as usize);
+    }
+    let (mut i, mut j) = (0u8, 0u8);
+    for byte in data {
+        i = i.wrapping_add(1);
+        j = j.wrapping_add(s[i as usize]);
+        s.swap(i as usize, j as usize);
+        *byte ^= s[s[i as usize].wrapping_add(s[j as usize]) as usize];
+    }
+}
+
+/// Handshake `step` 1 asks for the session key, step 2 confirms it. `nonce` is any random bytes.
+pub fn ble_handshake(step: u8, nonce: [u8; 17]) -> Vec<u8> {
+    let mut frame = vec![0xE7, step];
+    frame.extend_from_slice(&nonce);
+    ble_cipher(&with_xor(frame), &BLE_HANDSHAKE_KEY, true)
+}
+
+/// The 16 byte body of the light's answer to handshake `step` (the session key, for step 1).
+pub fn ble_handshake_reply(frame: &[u8], step: u8) -> Option<[u8; 16]> {
+    if frame.len() != 20 {
+        return None;
+    }
+    let plain = ble_cipher(frame, &BLE_HANDSHAKE_KEY, false);
+    (plain[0] == 0xE7 && plain[1] == step && xor(&plain) == 0).then(|| plain[2..18].try_into().unwrap())
 }
 
 /// Bytes a segment mask needs for `segments` segments (at least the 2 every model takes).
@@ -262,6 +318,29 @@ mod tests {
         let segment = ble_segment_color([9, 8, 7], 0x0105, 2);
         assert_eq!(segment[..7], [0x33, 0x05, 0x15, 0x01, 9, 8, 7]);
         assert_eq!(segment[12..14], [0x05, 0x01]);
+    }
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        hex.split(' ').map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
+    }
+
+    // Captured from an H6097
+    #[test]
+    fn ble_encryption_matches_a_real_light() {
+        let reply = bytes("D8 41 2E 4A 4E 73 BD 65 27 10 8C 41 E3 86 06 02 D0 9A 40 F9");
+        let key = ble_handshake_reply(&reply, 1).unwrap();
+        assert_eq!(key.to_vec(), bytes("5F 8F 36 1A 65 1D AC 58 CB 8B 82 76 91 D9 B8 74"));
+        assert_eq!(ble_handshake_reply(&reply, 2), None);
+        let keepalive = bytes("9D B2 58 16 92 04 DA EC 8D 40 D2 7F 35 56 9D 20 7E 74 44 DB");
+        assert_eq!(ble_cipher(&ble_keepalive(), &key, true), keepalive);
+        assert_eq!(ble_cipher(&keepalive, &key, false), ble_keepalive());
+    }
+
+    #[test]
+    fn ble_handshakes_round_trip() {
+        let frame = ble_handshake(2, [7; 17]);
+        assert_eq!(frame.len(), 20);
+        assert_eq!(ble_handshake_reply(&frame, 2), Some([7; 16]));
     }
 
     #[test]
